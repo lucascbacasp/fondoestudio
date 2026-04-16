@@ -1,0 +1,41 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Build outputs
+dist/
+build/
+.vercel/
+
+# Env files (NEVER commit secrets)
+.env
+.env.local
+.env.*.local
+
+# Hardhat
+contracts/cache/
+contracts/artifacts/
+contracts/typechain-types/
+contracts/ignition/deployments/
+
+# Claude / editor
+.claude/
+frontend/.claude/
+.DS_Store
+.vscode/
+.idea/
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# Testing
+coverage/
+
+# Unrelated/template files
+backgrounds/
+frontend/src/assets/hero.png
+frontend/src/assets/typescript.svg
+frontend/src/assets/vite.svg
