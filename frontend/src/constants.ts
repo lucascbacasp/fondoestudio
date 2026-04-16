@@ -7,7 +7,7 @@ export const USDC_ADDRESS: Record<number, Address> = {
 };
 
 export const FONDO_ADDRESS: Record<number, Address> = {
-  [celo.id]: "0x0000000000000000000000000000000000000000",
+  [celo.id]: "0x4c70B59a72E9D9408B8555Bc70a22a8341ADbf03",
   [celoSepolia.id]: "0x51b389ac394ecA85f1b421cE32038bb2673cF7E0",
 };
 

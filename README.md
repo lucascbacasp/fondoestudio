@@ -9,10 +9,19 @@ FondoEstudio es una **mini-app para MiniPay** (Opera Mini) deployada en **Celo**
 
 ## Live demo
 
-- **App:** https://frontend-86q40j13r-lucascbacasps-projects.vercel.app
-- **Network:** Celo Sepolia testnet (chainId 11142220)
-- **FondoEstudio contract:** [`0x51b389ac394ecA85f1b421cE32038bb2673cF7E0`](https://repo.sourcify.dev/contracts/full_match/11142220/0x51b389ac394ecA85f1b421cE32038bb2673cF7E0/) (verified on Sourcify)
-- **Mock USDC contract:** `0x4c70B59a72E9D9408B8555Bc70a22a8341ADbf03`
+### Celo Mainnet (production)
+- **Network:** Celo (chainId 42220)
+- **FondoEstudio contract:** [`0x4c70B59a72E9D9408B8555Bc70a22a8341ADbf03`](https://repo.sourcify.dev/contracts/full_match/42220/0x4c70B59a72E9D9408B8555Bc70a22a8341ADbf03/) (verified on Sourcify)
+- **USDC (Circle official):** [`0xcebA9300f2b948710d2653dD7B07f33A8B32118C`](https://celoscan.io/address/0xcebA9300f2b948710d2653dD7B07f33A8B32118C)
+- **Celoscan:** [View contract](https://celoscan.io/address/0x4c70B59a72E9D9408B8555Bc70a22a8341ADbf03)
+
+### Celo Sepolia (testnet)
+- **Network:** Celo Sepolia (chainId 11142220)
+- **FondoEstudio:** [`0x51b389ac394ecA85f1b421cE32038bb2673cF7E0`](https://repo.sourcify.dev/contracts/full_match/11142220/0x51b389ac394ecA85f1b421cE32038bb2673cF7E0/)
+- **MockUSDC:** `0x4c70B59a72E9D9408B8555Bc70a22a8341ADbf03`
+
+### Frontend
+- **App:** https://frontend-86q40j13r-lucascbacasps-projects.vercel.app (se actualiza con cada deploy)
 
 ## Como funciona
 
