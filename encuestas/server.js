@@ -1,16 +1,33 @@
-// Máquina de Encuestas — MVP lean (etapas 1, 3, 4, 5 del user journey,
-// más reenvío manual con límite de 1). Sin dependencias externas.
+// Máquina de Encuestas — backend + API + páginas públicas de encuesta.
 //
-//   node server.js          # http://localhost:3000
+//   node server.js          # tablero en http://localhost:3000
 //
-// Env: PORT, BASE_URL, DB_PATH, SEND_WEBHOOK_URL, ALERT_WEBHOOK_URL, OWNER_CONTACT
+// Flujo: cierre del trabajo -> encuesta programada (envío diferido) ->
+// envío automático (email / gateway WhatsApp) o tap-to-send (wa.me sin
+// API de Meta) -> respuesta de 1 tap -> alerta + caso si es insatisfecho ->
+// reseña de Google si es excelente. Scheduler interno para envíos
+// diferidos, reenvío a las 48hs y seguimiento semanal de casos.
+//
+// Env: PORT, BASE_URL, DB_PATH, SEND_DELAY_MINUTES, AUTO_REMINDER_HOURS,
+//      CASE_FOLLOWUP_DAYS, GOOGLE_REVIEW_URL, OWNER_CONTACT,
+//      SEND_WEBHOOK_URL, WHATSAPP_WEBHOOK_URL, ALERT_WEBHOOK_URL
 
 import { createServer } from 'node:http';
-import { openDb, newToken, upsertClient, metrics } from './db.js';
-import { deliver, surveyMessage, alertMessage } from './notify.js';
+import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import {
+  openDb, newToken, upsertClient, channelFor, normalizePhone, metrics, atRiskClients,
+} from './db.js';
+import {
+  deliver, waLink, hasWhatsAppGateway,
+  surveyMessage, alertMessage, followupMessage, resolutionMessage,
+} from './notify.js';
+import { startScheduler, dispatchDue, canAutoSend } from './scheduler.js';
 
 const PORT = Number(process.env.PORT || 3000);
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
+const DELAY_SECONDS = Math.round(Number(process.env.SEND_DELAY_MINUTES ?? 45) * 60);
+const PUBLIC_DIR = join(import.meta.dirname, 'public');
 const db = openDb();
 
 // ---------------------------------------------------------------- helpers
@@ -39,85 +56,74 @@ function readBody(req) {
   });
 }
 
-function page(title, content) {
-  return `<!doctype html>
-<html lang="es"><head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>${esc(title)}</title>
-<style>
-  :root { color-scheme: light dark; }
-  body { font-family: system-ui, sans-serif; max-width: 860px; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
-  h1 { font-size: 1.4rem; } h2 { font-size: 1.05rem; margin-top: 2rem; }
-  table { border-collapse: collapse; width: 100%; font-size: .92rem; }
-  th, td { text-align: left; padding: .4rem .6rem; border-bottom: 1px solid #8884; }
-  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: .8rem; margin: 1rem 0; }
-  .tile { border: 1px solid #8884; border-radius: 10px; padding: .8rem 1rem; }
-  .tile b { display: block; font-size: 1.8rem; }
-  .tile small { opacity: .7; }
-  .alert { border-left: 4px solid #d33; padding: .6rem .9rem; margin: .5rem 0; background: #d331; border-radius: 0 8px 8px 0; }
-  form.inline { display: inline; }
-  input, button { font: inherit; padding: .35rem .6rem; border-radius: 8px; border: 1px solid #8886; }
-  button { cursor: pointer; }
-  .rating-btns { display: grid; gap: 1rem; margin-top: 2rem; }
-  .rating-btns button { font-size: 1.3rem; padding: 1.1rem; border-radius: 14px; border-width: 2px; }
-  .muted { opacity: .65; font-size: .88rem; }
-  .ok { color: #2a7; }
-</style>
-</head><body>${content}</body></html>`;
-}
-
-function send(res, status, html) {
+const sendHtml = (res, status, html) => {
   res.writeHead(status, { 'content-type': 'text/html; charset=utf-8' });
   res.end(html);
-}
-
-function sendJson(res, status, obj) {
+};
+const sendJson = (res, status, obj) => {
   res.writeHead(status, { 'content-type': 'application/json' });
   res.end(JSON.stringify(obj));
-}
-
-function redirect(res, to) {
-  res.writeHead(303, { location: to });
+};
+const redirect = (res, to) => {
+  res.writeHead(302, { location: to });
   res.end();
-}
+};
+
+const getSurvey = (id) => db.prepare('SELECT * FROM surveys WHERE id = ?').get(Number(id));
+const getClient = (id) => db.prepare('SELECT * FROM clients WHERE id = ?').get(id);
+const getJob = (id) => db.prepare('SELECT * FROM jobs WHERE id = ?').get(id);
 
 // ------------------------------------------------------------- flujo core
 
-// Etapa 1+3: el cierre del trabajo dispara la encuesta sin pasos extra.
-// Con email conocido sale sola; sin email queda visible como "sin contacto".
-async function closeJob({ ref, type, clientName, clientEmail }) {
-  const client = upsertClient(db, { name: clientName, email: clientEmail });
-
-  const dupe = db.prepare('SELECT id FROM jobs WHERE ref = ?').get(ref);
-  if (dupe) return { duplicated: true };
-
-  const job = (() => {
-    const { lastInsertRowid } = db
-      .prepare('INSERT INTO jobs (ref, type, client_id) VALUES (?, ?, ?)')
-      .run(ref, type || null, client.id);
-    return db.prepare('SELECT * FROM jobs WHERE id = ?').get(lastInsertRowid);
-  })();
-
-  const token = newToken();
-  db.prepare('INSERT INTO surveys (job_id, client_id, token) VALUES (?, ?, ?)')
-    .run(job.id, client.id, token);
-  const survey = db.prepare('SELECT * FROM surveys WHERE token = ?').get(token);
-
-  if (client.email) await sendSurvey(survey, client, job, 'initial');
-  return { survey, sent: Boolean(client.email) };
-}
-
-async function sendSurvey(survey, client, job, kind) {
+async function sendSurvey(survey, kind) {
+  const client = getClient(survey.client_id);
+  const job = getJob(survey.job_id);
   const msg = surveyMessage(BASE_URL, survey, client, job, kind);
-  await deliver(db, { surveyId: survey.id, kind, recipient: client.email, ...msg });
+  const recipient = survey.channel === 'email' ? client.email : client.phone;
+  await deliver(db, { surveyId: survey.id, kind, channel: survey.channel, recipient, ...msg });
   if (kind === 'initial') {
     db.prepare(
-      "UPDATE surveys SET status = 'sent', sent_at = datetime('now') WHERE id = ? AND status = 'pending_contact'"
+      "UPDATE surveys SET status = 'sent', sent_at = datetime('now') WHERE id = ? AND status IN ('scheduled','ready')"
     ).run(survey.id);
   } else {
     db.prepare('UPDATE surveys SET resend_count = resend_count + 1 WHERE id = ?').run(survey.id);
   }
+}
+
+async function sendFollowup(kase) {
+  const client = getClient(kase.client_id);
+  const survey = getSurvey(kase.survey_id);
+  const job = getJob(survey.job_id);
+  await deliver(db, {
+    surveyId: survey.id,
+    kind: 'followup',
+    channel: 'interno',
+    recipient: process.env.OWNER_CONTACT || 'dueño',
+    ...followupMessage(kase, client, job),
+  });
+}
+
+// Etapa 1: el cierre del trabajo dispara todo, sin pasos extra.
+async function closeJob({ ref, type, clientName, clientEmail, clientPhone }) {
+  const client = upsertClient(db, { name: clientName, email: clientEmail, phone: clientPhone });
+
+  if (db.prepare('SELECT id FROM jobs WHERE ref = ?').get(ref)) return { duplicated: true };
+
+  const { lastInsertRowid: jobId } = db
+    .prepare('INSERT INTO jobs (ref, type, client_id) VALUES (?, ?, ?)')
+    .run(ref, type || null, client.id);
+
+  const channel = channelFor(client);
+  const token = newToken();
+  db.prepare(`
+    INSERT INTO surveys (job_id, client_id, token, channel, status, scheduled_at)
+    VALUES (?, ?, ?, ?, ?, CASE WHEN ? IS NULL THEN NULL ELSE datetime('now', '+' || ? || ' seconds') END)
+  `).run(jobId, client.id, token, channel, channel ? 'scheduled' : 'pending_contact', channel, DELAY_SECONDS);
+
+  // Con delay 0 sale en este mismo request; con delay, la levanta el scheduler.
+  await dispatchDue(db, sendSurvey);
+  const survey = db.prepare('SELECT * FROM surveys WHERE token = ?').get(token);
+  return { survey };
 }
 
 // Etapa 4: registrar respuesta. Idempotente: la primera respuesta gana.
@@ -129,16 +135,18 @@ async function recordResponse(token, rating) {
   db.prepare(
     "UPDATE surveys SET status = 'responded', rating = ?, responded_at = datetime('now') WHERE id = ?"
   ).run(rating, survey.id);
-  const updated = db.prepare('SELECT * FROM surveys WHERE id = ?').get(survey.id);
+  const updated = getSurvey(survey.id);
 
-  // Etapa 5, riesgo #2: el insatisfecho no es un número, es una alerta
-  // inmediata con el dato del cliente para recuperarlo en el día.
+  // Insatisfecho = alerta inmediata al dueño + caso abierto (recuperación).
   if (rating === 'insatisfecho') {
-    const client = db.prepare('SELECT * FROM clients WHERE id = ?').get(survey.client_id);
-    const job = db.prepare('SELECT * FROM jobs WHERE id = ?').get(survey.job_id);
+    db.prepare('INSERT OR IGNORE INTO cases (survey_id, client_id) VALUES (?, ?)')
+      .run(survey.id, survey.client_id);
+    const client = getClient(survey.client_id);
+    const job = getJob(survey.job_id);
     await deliver(db, {
       surveyId: survey.id,
       kind: 'alert',
+      channel: 'interno',
       recipient: process.env.OWNER_CONTACT || 'dueño',
       ...alertMessage(updated, client, job),
     });
@@ -146,7 +154,35 @@ async function recordResponse(token, rating) {
   return { survey: updated };
 }
 
-// ------------------------------------------------------------------ vistas
+// wa.me con el mensaje prearmado para una encuesta (modo tap-to-send).
+function surveyWaLink(survey, kind) {
+  const client = getClient(survey.client_id);
+  const job = getJob(survey.job_id);
+  const { body } = surveyMessage(BASE_URL, survey, client, job, kind);
+  return waLink(client.phone, body);
+}
+
+// --------------------------------------------------- páginas públicas (SSR)
+
+function publicPage(title, content) {
+  return `<!doctype html>
+<html lang="es"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${esc(title)}</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; max-width: 480px; margin: 8vh auto; padding: 0 1.2rem; line-height: 1.5; }
+  h1 { font-size: 1.35rem; }
+  .muted { opacity: .65; font-size: .9rem; }
+  .btns { display: grid; gap: 1rem; margin-top: 2rem; }
+  .btns button, .cta { font: inherit; font-size: 1.25rem; padding: 1.1rem; border-radius: 14px;
+    border: 2px solid #8886; background: transparent; cursor: pointer; width: 100%;
+    text-align: center; text-decoration: none; display: block; color: inherit; box-sizing: border-box; }
+  .btns button:hover, .cta:hover { border-color: #58a; }
+  .cta { border-color: #f7b32b; margin-top: 1.5rem; }
+</style>
+</head><body>${content}</body></html>`;
+}
 
 const RATINGS = [
   ['insatisfecho', '😞 Insatisfecho'],
@@ -154,171 +190,251 @@ const RATINGS = [
   ['excelente', '🤩 Excelente'],
 ];
 
-function surveyPage(survey, job) {
-  return page('¿Cómo salió el trabajo?', `
-    <h1>¿Cómo salió el trabajo${job.type ? ` de ${esc(job.type)}` : ''}?</h1>
-    <p class="muted">Un solo toque y listo. Sin registrarse.</p>
-    <div class="rating-btns">
-      ${RATINGS.map(([value, label]) => `
-        <form method="post" action="/s/${esc(survey.token)}">
-          <input type="hidden" name="rating" value="${value}">
-          <button style="width:100%">${label}</button>
-        </form>`).join('')}
-    </div>`);
-}
+const surveyPageHtml = (survey, job) => publicPage('¿Cómo salió el trabajo?', `
+  <h1>¿Cómo salió el trabajo${job.type ? ` de ${esc(job.type)}` : ''}?</h1>
+  <p class="muted">Un solo toque y listo. Sin registrarse.</p>
+  <div class="btns">
+    ${RATINGS.map(([value, label]) => `
+      <form method="post" action="/s/${esc(survey.token)}">
+        <input type="hidden" name="rating" value="${value}">
+        <button>${label}</button>
+      </form>`).join('')}
+  </div>`);
 
-function thanksPage(already) {
-  return page('¡Gracias!', `
+// Excelente -> pedido de reseña pública (growth loop adoptado de BERLIM).
+function thanksPageHtml({ already, rating }) {
+  const review = rating === 'excelente' && process.env.GOOGLE_REVIEW_URL
+    ? `<a class="cta" href="${esc(process.env.GOOGLE_REVIEW_URL)}">⭐ ¿Nos dejás una reseña en Google?<br>
+       <span class="muted">Nos ayuda muchísimo y toma 1 minuto</span></a>`
+    : '';
+  return publicPage('¡Gracias!', `
     <h1>¡Gracias por tu respuesta! 🙌</h1>
-    <p class="muted">${already ? 'Ya habíamos registrado tu respuesta anterior.' : 'Tu opinión nos ayuda a mejorar.'}</p>`);
+    <p class="muted">${already ? 'Ya habíamos registrado tu respuesta anterior.' : 'Tu opinión nos ayuda a mejorar.'}</p>
+    ${review}`);
 }
 
-function dashboardPage() {
-  const m = metrics(db);
+// ----------------------------------------------------------- estado (API)
+
+function stateForDashboard() {
   const rows = db.prepare(`
-    SELECT s.*, c.name AS client_name, c.email AS client_email, j.ref AS job_ref, j.type AS job_type
+    SELECT s.*, c.name AS client_name, c.email AS client_email, c.phone AS client_phone,
+           j.ref AS job_ref, j.type AS job_type
     FROM surveys s JOIN clients c ON c.id = s.client_id JOIN jobs j ON j.id = s.job_id
-    ORDER BY s.created_at DESC LIMIT 100
+    ORDER BY s.created_at DESC LIMIT 200
   `).all();
 
-  const insatisfechos = rows.filter((r) => r.rating === 'insatisfecho');
-  const sinContacto = rows.filter((r) => r.status === 'pending_contact');
-  const sinRespuesta = rows.filter((r) => r.status === 'sent');
+  const brief = (r) => ({
+    id: r.id, status: r.status, channel: r.channel, rating: r.rating,
+    resend_count: r.resend_count, scheduled_at: r.scheduled_at, sent_at: r.sent_at,
+    responded_at: r.responded_at, client_name: r.client_name,
+    client_email: r.client_email, client_phone: r.client_phone,
+    job_ref: r.job_ref, job_type: r.job_type,
+  });
 
-  return page('Encuestas — Dashboard', `
-    <h1>Máquina de Encuestas</h1>
+  const cases = db.prepare(`
+    SELECT k.*, c.name AS client_name, c.email AS client_email, c.phone AS client_phone,
+           j.ref AS job_ref, j.type AS job_type, s.responded_at
+    FROM cases k
+    JOIN surveys s ON s.id = k.survey_id
+    JOIN clients c ON c.id = k.client_id
+    JOIN jobs j ON j.id = s.job_id
+    ORDER BY (k.status = 'resuelto'), k.opened_at DESC LIMIT 50
+  `).all();
 
-    <div class="tiles">
-      <div class="tile"><b>${m.pct_enviadas}%</b><small>enviadas (${m.enviadas}/${m.total})</small></div>
-      <div class="tile"><b>${m.pct_respondidas}%</b><small>respondidas (${m.respondidas}/${m.enviadas})</small></div>
-      <div class="tile"><b>${m.pct_satisfaccion}%</b><small>satisfacción</small></div>
-      <div class="tile"><b>${m.desglose.insatisfecho} / ${m.desglose.bueno} / ${m.desglose.excelente}</b>
-        <small>insatisfecho / bueno / excelente</small></div>
-    </div>
-
-    ${insatisfechos.length ? `<h2>⚠ Insatisfechos — llamar hoy</h2>` +
-      insatisfechos.map((r) => `
-        <div class="alert"><b>${esc(r.client_name)}</b> — trabajo ${esc(r.job_ref)}
-          ${r.job_type ? `(${esc(r.job_type)})` : ''}<br>
-          <span class="muted">${esc(r.client_email || 'sin email')} · respondió ${esc(r.responded_at)}</span>
-        </div>`).join('') : ''}
-
-    ${sinContacto.length ? `<h2>Sin contacto — cargar email para enviar</h2>
-      <table><tr><th>Cliente</th><th>Trabajo</th><th></th></tr>` +
-      sinContacto.map((r) => `
-        <tr><td>${esc(r.client_name)}</td><td>${esc(r.job_ref)}</td>
-        <td><form class="inline" method="post" action="/surveys/${r.id}/contact">
-          <input name="email" type="email" placeholder="email@cliente.com" required>
-          <button>Guardar y enviar</button></form></td></tr>`).join('') + '</table>' : ''}
-
-    ${sinRespuesta.length ? `<h2>Enviadas sin respuesta</h2>
-      <table><tr><th>Cliente</th><th>Trabajo</th><th>Enviada</th><th></th></tr>` +
-      sinRespuesta.map((r) => `
-        <tr><td>${esc(r.client_name)}</td><td>${esc(r.job_ref)}</td>
-        <td class="muted">${esc(r.sent_at)}</td>
-        <td>${r.resend_count >= 1
-          ? '<span class="muted">reenviada (límite: 1)</span>'
-          : `<form class="inline" method="post" action="/surveys/${r.id}/resend"><button>Reenviar</button></form>`}
-        </td></tr>`).join('') + '</table>' : ''}
-
-    <h2>Simular cierre de trabajo</h2>
-    <p class="muted">En producción esto lo dispara el sistema del operario vía
-      <code>POST /api/jobs/close</code>. Si el cliente ya existe con email, no hace falta cargarlo.</p>
-    <form method="post" action="/api/jobs/close">
-      <input name="ref" placeholder="Nro de trabajo" required>
-      <input name="type" placeholder="Tipo (ej: plomería)">
-      <input name="client_name" placeholder="Cliente" required>
-      <input name="client_email" type="email" placeholder="Email (opcional)">
-      <button>Cerrar trabajo</button>
-    </form>`);
+  return {
+    metrics: metrics(db),
+    at_risk: atRiskClients(db),
+    cases,
+    pending_contact: rows.filter((r) => r.status === 'pending_contact').map(brief),
+    ready: rows.filter((r) => r.status === 'ready').map(brief),
+    scheduled: rows.filter((r) => r.status === 'scheduled').map(brief),
+    unanswered: rows.filter((r) => r.status === 'sent')
+      .map((r) => ({ ...brief(r), can_auto: canAutoSend(r.channel) })),
+    responded: rows.filter((r) => r.status === 'responded').slice(0, 20).map(brief),
+    activity: db.prepare('SELECT * FROM outbox ORDER BY id DESC LIMIT 15').all(),
+    config: {
+      delay_minutes: DELAY_SECONDS / 60,
+      wa_gateway: hasWhatsAppGateway(),
+      google_review: Boolean(process.env.GOOGLE_REVIEW_URL),
+      auto_reminder_hours: Number(process.env.AUTO_REMINDER_HOURS ?? 48),
+    },
+  };
 }
 
 // ------------------------------------------------------------------ rutas
+
+const STATIC = {
+  '/': ['index.html', 'text/html; charset=utf-8'],
+  '/app.js': ['app.js', 'text/javascript; charset=utf-8'],
+  '/style.css': ['style.css', 'text/css; charset=utf-8'],
+};
 
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, BASE_URL);
   const path = url.pathname;
 
   try {
-    if (req.method === 'GET' && path === '/') return send(res, 200, dashboardPage());
+    // ------- tablero (SPA estática, sin build)
+    if (req.method === 'GET' && STATIC[path]) {
+      const [file, type] = STATIC[path];
+      res.writeHead(200, { 'content-type': type });
+      return res.end(await readFile(join(PUBLIC_DIR, file)));
+    }
+
+    if (req.method === 'GET' && path === '/api/state') return sendJson(res, 200, stateForDashboard());
     if (req.method === 'GET' && path === '/api/metrics') return sendJson(res, 200, metrics(db));
 
-    // Etapa 1: hook de cierre. Acepta JSON (integración) o form (demo).
+    // ------- Etapa 1: hook de cierre de trabajo
     if (req.method === 'POST' && path === '/api/jobs/close') {
       const b = await readBody(req);
       const ref = (b.ref || '').trim();
-      const clientName = (b.client_name || b.clientName || '').trim();
+      const clientName = (b.client_name || '').trim();
       if (!ref || !clientName)
         return sendJson(res, 400, { error: 'ref y client_name son obligatorios' });
       const result = await closeJob({
         ref,
         type: (b.type || '').trim(),
         clientName,
-        clientEmail: (b.client_email || b.clientEmail || '').trim() || null,
+        clientEmail: b.client_email,
+        clientPhone: b.client_phone,
       });
-      if (req.headers['content-type']?.includes('application/json')) {
-        if (result.duplicated) return sendJson(res, 409, { error: 'trabajo ya cerrado' });
-        return sendJson(res, 201, { survey_url: `${BASE_URL}/s/${result.survey.token}`, sent: result.sent });
-      }
-      return redirect(res, '/');
+      if (result.duplicated) return sendJson(res, 409, { error: 'trabajo ya cerrado' });
+      const s = getSurvey(result.survey.id);
+      return sendJson(res, 201, {
+        survey_id: s.id,
+        survey_url: `${BASE_URL}/s/${s.token}`,
+        status: s.status,
+        channel: s.channel,
+      });
     }
 
-    // Etapa 3: rescate de contacto faltante (queda guardado para la próxima).
-    const contactMatch = path.match(/^\/surveys\/(\d+)\/contact$/);
-    if (req.method === 'POST' && contactMatch) {
+    // ------- Etapa 3: rescate de contacto faltante (queda guardado)
+    let m = path.match(/^\/api\/surveys\/(\d+)\/contact$/);
+    if (req.method === 'POST' && m) {
+      const survey = getSurvey(m[1]);
       const b = await readBody(req);
-      const survey = db.prepare('SELECT * FROM surveys WHERE id = ?').get(Number(contactMatch[1]));
       const email = (b.email || '').trim();
-      if (!survey || survey.status !== 'pending_contact' || !email)
-        return send(res, 400, page('Error', '<p>Encuesta o email inválidos.</p>'));
-      db.prepare('UPDATE clients SET email = ? WHERE id = ?').run(email, survey.client_id);
-      const client = db.prepare('SELECT * FROM clients WHERE id = ?').get(survey.client_id);
-      const job = db.prepare('SELECT * FROM jobs WHERE id = ?').get(survey.job_id);
-      await sendSurvey(survey, client, job, 'initial');
-      return redirect(res, '/');
+      const phone = normalizePhone(b.phone);
+      if (!survey || survey.status !== 'pending_contact')
+        return sendJson(res, 400, { error: 'encuesta inválida' });
+      if (!email && !phone)
+        return sendJson(res, 400, { error: 'hace falta email o teléfono' });
+
+      const client = getClient(survey.client_id);
+      db.prepare('UPDATE clients SET email = coalesce(?, email), phone = coalesce(?, phone) WHERE id = ?')
+        .run(email || null, phone, client.id);
+      const channel = channelFor(getClient(client.id));
+      // Ya esperó bastante: sale ahora, sin delay extra.
+      db.prepare("UPDATE surveys SET channel = ?, status = 'scheduled', scheduled_at = datetime('now') WHERE id = ?")
+        .run(channel, survey.id);
+      await dispatchDue(db, sendSurvey);
+      const s = getSurvey(survey.id);
+      return sendJson(res, 200, { status: s.status, channel: s.channel });
     }
 
-    // Etapa 6 (versión MVP): reenvío manual, máximo 1 por encuesta.
-    const resendMatch = path.match(/^\/surveys\/(\d+)\/resend$/);
-    if (req.method === 'POST' && resendMatch) {
-      const survey = db.prepare('SELECT * FROM surveys WHERE id = ?').get(Number(resendMatch[1]));
+    // ------- WhatsApp tap-to-send: marca y redirige a wa.me (sin API de Meta)
+    m = path.match(/^\/wa\/(\d+)$/);
+    if (req.method === 'GET' && m) {
+      const survey = getSurvey(m[1]);
+      if (!survey || survey.channel !== 'whatsapp')
+        return sendHtml(res, 404, publicPage('Error', '<p>Encuesta no encontrada.</p>'));
+      if (survey.status === 'ready') {
+        const link = surveyWaLink(survey, 'initial');
+        await sendSurvey(survey, 'initial');
+        return redirect(res, link);
+      }
+      if (survey.status === 'sent' && survey.resend_count === 0) {
+        const link = surveyWaLink(survey, 'reminder');
+        await sendSurvey(survey, 'reminder');
+        return redirect(res, link);
+      }
+      return sendHtml(res, 409, publicPage('Límite', '<p>Esta encuesta ya se envió (máximo 1 reenvío).</p>'));
+    }
+
+    // ------- Reenvío manual por canal automático (máximo 1)
+    m = path.match(/^\/api\/surveys\/(\d+)\/resend$/);
+    if (req.method === 'POST' && m) {
+      const survey = getSurvey(m[1]);
       if (!survey || survey.status !== 'sent')
-        return send(res, 400, page('Error', '<p>Encuesta inválida.</p>'));
+        return sendJson(res, 400, { error: 'encuesta inválida' });
       if (survey.resend_count >= 1)
-        return send(res, 409, page('Límite', '<p>Ya se reenvió una vez. La regla es 1 reenvío y cortar.</p>'));
-      const client = db.prepare('SELECT * FROM clients WHERE id = ?').get(survey.client_id);
-      const job = db.prepare('SELECT * FROM jobs WHERE id = ?').get(survey.job_id);
-      await sendSurvey(survey, client, job, 'reminder');
-      return redirect(res, '/');
+        return sendJson(res, 409, { error: 'ya se reenvió una vez (la regla es 1 y cortar)' });
+      if (!canAutoSend(survey.channel))
+        return sendJson(res, 400, { error: 'canal sin vía automática: usá el botón de WhatsApp' });
+      await sendSurvey(survey, 'reminder');
+      return sendJson(res, 200, { ok: true });
     }
 
-    // Etapa 4: la encuesta. Una pregunta, tres botones, sin login.
-    const surveyMatch = path.match(/^\/s\/([a-f0-9]{32})$/);
-    if (surveyMatch) {
+    // ------- Casos de insatisfechos: estado + notas
+    m = path.match(/^\/api\/cases\/(\d+)$/);
+    if (req.method === 'POST' && m) {
+      const kase = db.prepare('SELECT * FROM cases WHERE id = ?').get(Number(m[1]));
+      if (!kase) return sendJson(res, 404, { error: 'caso no encontrado' });
+      const b = await readBody(req);
+      if (b.status && !['abierto', 'en_tratamiento', 'resuelto'].includes(b.status))
+        return sendJson(res, 400, { error: 'estado inválido' });
+
+      const status = b.status || kase.status;
+      const notes = b.notes !== undefined ? String(b.notes).slice(0, 2000) : kase.notes;
+      db.prepare(`
+        UPDATE cases SET status = ?, notes = ?,
+          resolved_at = CASE WHEN ? = 'resuelto' AND resolved_at IS NULL THEN datetime('now') ELSE resolved_at END
+        WHERE id = ?
+      `).run(status, notes, status, kase.id);
+
+      // Al resolver: agradecimiento al cliente con foco en la resolución.
+      let waResolution = null;
+      if (status === 'resuelto' && kase.status !== 'resuelto') {
+        const client = getClient(kase.client_id);
+        const survey = getSurvey(kase.survey_id);
+        const job = getJob(survey.job_id);
+        const channel = channelFor(client) || 'email';
+        const msg = resolutionMessage(client, job);
+        await deliver(db, {
+          surveyId: survey.id,
+          kind: 'resolution',
+          channel,
+          recipient: channel === 'email' ? client.email : client.phone,
+          ...msg,
+        });
+        if (channel === 'whatsapp' && !hasWhatsAppGateway())
+          waResolution = waLink(client.phone, msg.body);
+      }
+      return sendJson(res, 200, { ok: true, wa_link: waResolution });
+    }
+
+    // ------- Etapa 4: encuesta pública (1 pregunta, 3 botones, sin login)
+    m = path.match(/^\/s\/([a-f0-9]{32})$/);
+    if (m) {
+      const survey = db.prepare('SELECT * FROM surveys WHERE token = ?').get(m[1]);
+      if (!survey) return sendHtml(res, 404, publicPage('No encontrada', '<p>Encuesta no encontrada.</p>'));
       if (req.method === 'GET') {
-        const survey = db.prepare('SELECT * FROM surveys WHERE token = ?').get(surveyMatch[1]);
-        if (!survey) return send(res, 404, page('No encontrada', '<p>Encuesta no encontrada.</p>'));
-        if (survey.status === 'responded') return send(res, 200, thanksPage(true));
-        const job = db.prepare('SELECT * FROM jobs WHERE id = ?').get(survey.job_id);
-        return send(res, 200, surveyPage(survey, job));
+        if (survey.status === 'responded')
+          return sendHtml(res, 200, thanksPageHtml({ already: true, rating: survey.rating }));
+        return sendHtml(res, 200, surveyPageHtml(survey, getJob(survey.job_id)));
       }
       if (req.method === 'POST') {
         const b = await readBody(req);
         if (!['insatisfecho', 'bueno', 'excelente'].includes(b.rating))
-          return send(res, 400, page('Error', '<p>Respuesta inválida.</p>'));
-        const result = await recordResponse(surveyMatch[1], b.rating);
-        if (result.error) return send(res, 404, page('No encontrada', '<p>Encuesta no encontrada.</p>'));
-        return send(res, 200, thanksPage(result.already));
+          return sendHtml(res, 400, publicPage('Error', '<p>Respuesta inválida.</p>'));
+        const result = await recordResponse(m[1], b.rating);
+        return sendHtml(res, 200, thanksPageHtml({
+          already: result.already,
+          rating: result.survey.rating,
+        }));
       }
     }
 
-    send(res, 404, page('404', '<p>No encontrado.</p>'));
+    sendJson(res, 404, { error: 'no encontrado' });
   } catch (err) {
     console.error(err);
-    send(res, 500, page('Error', '<p>Error interno.</p>'));
+    sendJson(res, 500, { error: 'error interno' });
   }
 });
 
+startScheduler(db, { sendSurvey, sendFollowup });
+
 server.listen(PORT, () => {
   console.log(`Máquina de Encuestas corriendo en ${BASE_URL}`);
+  console.log(`  envío diferido: ${DELAY_SECONDS / 60} min · gateway WhatsApp: ${hasWhatsAppGateway() ? 'sí' : 'modo tap-to-send'}`);
 });

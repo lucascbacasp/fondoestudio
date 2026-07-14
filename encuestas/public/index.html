@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Máquina de Encuestas</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header>
+    <h1>Máquina de Encuestas</h1>
+    <p id="config-line" class="muted"></p>
+  </header>
+
+  <main id="app" aria-live="polite">
+    <p class="muted">Cargando…</p>
+  </main>
+
+  <footer class="muted">
+    El sistema envía por email automáticamente y por WhatsApp con un tap
+    (link <code>wa.me</code>, sin API de Meta). Todo lo que sale queda
+    registrado en la actividad.
+  </footer>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

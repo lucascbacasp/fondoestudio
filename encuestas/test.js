@@ -1,121 +1,223 @@
-// Smoke test end-to-end: recorre el journey completo contra el server real.
+// Smoke test end-to-end contra el server real.
 //   node --test test.js
+//
+// Server A (:3777): envío inmediato — flujos de negocio.
+// Server B (:3778): tiempos acelerados — scheduler (diferido, recordatorio,
+// seguimiento de casos).
+
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { rmSync } from 'node:fs';
 
-const PORT = 3777;
-const BASE = `http://localhost:${PORT}`;
-const DB = 'test-encuestas.db';
-let server;
+const A = 'http://localhost:3777';
+const B = 'http://localhost:3778';
+const DBS = ['test-a.db', 'test-b.db'];
+const REVIEW_URL = 'https://g.page/r/test-review';
+const servers = [];
 
-before(async () => {
-  for (const f of [DB, `${DB}-wal`, `${DB}-shm`]) rmSync(f, { force: true });
-  server = spawn(process.execPath, ['server.js'], {
-    env: { ...process.env, PORT, DB_PATH: DB, SEND_WEBHOOK_URL: '', ALERT_WEBHOOK_URL: '' },
+function startServer(port, dbPath, env) {
+  const proc = spawn(process.execPath, ['server.js'], {
+    env: {
+      ...process.env, PORT: port, DB_PATH: dbPath,
+      SEND_WEBHOOK_URL: '', WHATSAPP_WEBHOOK_URL: '', ALERT_WEBHOOK_URL: '',
+      ...env,
+    },
     stdio: 'ignore',
   });
+  servers.push(proc);
+  return proc;
+}
+
+async function waitUp(base) {
   for (let i = 0; i < 50; i++) {
-    try { await fetch(BASE); return; } catch { await new Promise((r) => setTimeout(r, 100)); }
+    try { await fetch(base + '/api/metrics'); return; }
+    catch { await new Promise((r) => setTimeout(r, 100)); }
   }
-  throw new Error('el server no levantó');
-});
+  throw new Error(`no levantó ${base}`);
+}
 
-after(() => {
-  server.kill();
-  for (const f of [DB, `${DB}-wal`, `${DB}-shm`]) rmSync(f, { force: true });
-});
+async function poll(fn, timeoutMs = 8000) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < timeoutMs) {
+    const v = await fn();
+    if (v) return v;
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  throw new Error('poll timeout');
+}
 
-const closeJob = (body) =>
-  fetch(`${BASE}/api/jobs/close`, {
+const state = (base) => fetch(base + '/api/state').then((r) => r.json());
+const closeJob = (base, body) =>
+  fetch(base + '/api/jobs/close', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),
   });
+const post = (base, path, body) =>
+  fetch(base + path, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body || {}),
+  });
+const respond = (surveyUrl, rating) =>
+  fetch(surveyUrl, {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: `rating=${rating}`,
+  });
 
-test('etapas 1+3: cierre con email envía automático', async () => {
-  const res = await closeJob({ ref: 'J-1', type: 'plomería', client_name: 'Ana', client_email: 'ana@x.com' });
+before(async () => {
+  for (const f of DBS.flatMap((d) => [d, `${d}-wal`, `${d}-shm`])) rmSync(f, { force: true });
+  startServer(3777, 'test-a.db', {
+    SEND_DELAY_MINUTES: '0', AUTO_REMINDER_HOURS: '0', TICK_MS: '100000',
+    GOOGLE_REVIEW_URL: REVIEW_URL,
+  });
+  startServer(3778, 'test-b.db', {
+    SEND_DELAY_MINUTES: '0.03',        // ~2s de envío diferido
+    AUTO_REMINDER_HOURS: '0.0008',     // recordatorio ~3s después del envío
+    CASE_FOLLOWUP_DAYS: '0.00003',     // seguimiento ~2.6s después de abrir caso
+    TICK_MS: '300',
+  });
+  await Promise.all([waitUp(A), waitUp(B)]);
+});
+
+after(() => {
+  for (const p of servers) p.kill();
+  for (const f of DBS.flatMap((d) => [d, `${d}-wal`, `${d}-shm`])) rmSync(f, { force: true });
+});
+
+// --------------------------------------------------------- flujos (server A)
+
+test('cierre con email envía automático de inmediato (delay 0)', async () => {
+  const res = await closeJob(A, { ref: 'A-1', type: 'plomería', client_name: 'Ana', client_email: 'ana@x.com' });
   assert.equal(res.status, 201);
-  const { survey_url, sent } = await res.json();
-  assert.equal(sent, true);
-  assert.match(survey_url, /\/s\/[a-f0-9]{32}$/);
+  const body = await res.json();
+  assert.equal(body.status, 'sent');
+  assert.equal(body.channel, 'email');
+  assert.match(body.survey_url, /\/s\/[a-f0-9]{32}$/);
 });
 
-test('etapa 1: cierre duplicado no genera segunda encuesta', async () => {
-  const res = await closeJob({ ref: 'J-1', client_name: 'Ana' });
-  assert.equal(res.status, 409);
+test('cierre duplicado devuelve 409', async () => {
+  assert.equal((await closeJob(A, { ref: 'A-1', client_name: 'Ana' })).status, 409);
 });
 
-test('etapas 4+5: responder insatisfecho registra y dispara alerta', async () => {
-  const res = await closeJob({ ref: 'J-2', client_name: 'Beto', client_email: 'beto@x.com' });
+test('whatsapp sin gateway: queda ready y /wa marca + redirige a wa.me', async () => {
+  const res = await closeJob(A, { ref: 'A-2', client_name: 'Beto', client_phone: '+54 9 11 2233-4455' });
+  const body = await res.json();
+  assert.equal(body.channel, 'whatsapp');
+  assert.equal(body.status, 'ready');
+
+  const s = await state(A);
+  const item = s.ready.find((r) => r.job_ref === 'A-2');
+  assert.equal(item.client_phone, '5491122334455');
+
+  // Tap inicial: 302 a wa.me con el mensaje y el link de la encuesta.
+  const tap = await fetch(`${A}/wa/${item.id}`, { redirect: 'manual' });
+  assert.equal(tap.status, 302);
+  const loc = tap.headers.get('location');
+  assert.match(loc, /^https:\/\/wa\.me\/5491122334455\?text=/);
+  assert.match(decodeURIComponent(loc), /\/s\/[a-f0-9]{32}/);
+
+  // Quedó enviada; segundo tap = recordatorio; tercero = límite.
+  const tap2 = await fetch(`${A}/wa/${item.id}`, { redirect: 'manual' });
+  assert.equal(tap2.status, 302);
+  const tap3 = await fetch(`${A}/wa/${item.id}`, { redirect: 'manual' });
+  assert.equal(tap3.status, 409);
+});
+
+test('respuesta excelente muestra CTA de reseña de Google', async () => {
+  const res = await closeJob(A, { ref: 'A-3', client_name: 'Caro', client_email: 'caro@x.com' });
   const { survey_url } = await res.json();
+  const html = await (await respond(survey_url, 'excelente')).text();
+  assert.match(html, /Gracias/);
+  assert.ok(html.includes(REVIEW_URL), 'falta el link de reseña');
+});
 
-  const pageRes = await fetch(survey_url);
-  assert.equal(pageRes.status, 200);
-  assert.match(await pageRes.text(), /Insatisfecho/);
+test('insatisfecho abre caso + alerta; el caso se trata y resuelve', async () => {
+  const res = await closeJob(A, { ref: 'A-4', client_name: 'Dario', client_email: 'dario@x.com' });
+  const { survey_url } = await res.json();
+  await respond(survey_url, 'insatisfecho');
 
-  const answer = await fetch(survey_url, {
-    method: 'POST',
-    headers: { 'content-type': 'application/x-www-form-urlencoded' },
-    body: 'rating=insatisfecho',
-  });
-  assert.equal(answer.status, 200);
-  assert.match(await answer.text(), /Gracias/);
+  let s = await state(A);
+  const kase = s.cases.find((k) => k.job_ref === 'A-4');
+  assert.equal(kase.status, 'abierto');
+  assert.ok(s.activity.some((a) => a.kind === 'alert' && a.subject.includes('Dario')));
+  assert.equal(s.metrics.casos_abiertos >= 1, true);
 
-  // Idempotencia: una segunda respuesta no pisa la primera.
-  const again = await fetch(survey_url, {
-    method: 'POST',
-    headers: { 'content-type': 'application/x-www-form-urlencoded' },
-    body: 'rating=excelente',
-  });
+  // Idempotencia de la respuesta: la primera gana.
+  const again = await respond(survey_url, 'excelente');
   assert.match(await again.text(), /Ya habíamos registrado/);
 
-  const m = await (await fetch(`${BASE}/api/metrics`)).json();
-  assert.equal(m.desglose.insatisfecho, 1);
-  assert.equal(m.desglose.excelente, 0);
+  await post(A, `/api/cases/${kase.id}`, { status: 'en_tratamiento', notes: 'lo llamé' });
+  const r2 = await post(A, `/api/cases/${kase.id}`, { status: 'resuelto' });
+  assert.equal((await r2.json()).ok, true);
 
-  // La alerta quedó visible en el dashboard con el dato del cliente.
-  const dash = await (await fetch(BASE)).text();
-  assert.match(dash, /Insatisfechos — llamar hoy/);
-  assert.match(dash, /Beto/);
+  s = await state(A);
+  const resolved = s.cases.find((k) => k.id === kase.id);
+  assert.equal(resolved.status, 'resuelto');
+  assert.ok(resolved.resolved_at);
+  assert.equal(resolved.notes, 'lo llamé');
+  // Agradecimiento post-resolución al cliente.
+  assert.ok(s.activity.some((a) => a.kind === 'resolution' && a.recipient === 'dario@x.com'));
 });
 
-test('etapa 3: sin email queda pendiente; cargar contacto envía y lo guarda', async () => {
-  await closeJob({ ref: 'J-3', client_name: 'Carla' });
-  let dash = await (await fetch(BASE)).text();
-  assert.match(dash, /Sin contacto/);
+test('sin contacto: rescate lo envía y queda en memoria para el próximo', async () => {
+  await closeJob(A, { ref: 'A-5', client_name: 'Elsa' });
+  let s = await state(A);
+  const item = s.pending_contact.find((r) => r.job_ref === 'A-5');
+  assert.ok(item);
 
-  const id = dash.match(/\/surveys\/(\d+)\/contact/)[1];
-  const res = await fetch(`${BASE}/surveys/${id}/contact`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/x-www-form-urlencoded' },
-    body: 'email=carla%40x.com',
-    redirect: 'manual',
+  const r = await post(A, `/api/surveys/${item.id}/contact`, { email: 'elsa@x.com' });
+  assert.equal((await r.json()).status, 'sent');
+
+  // Memoria de contactos: el próximo trabajo de Elsa sale solo.
+  const next = await (await closeJob(A, { ref: 'A-6', client_name: 'Elsa' })).json();
+  assert.equal(next.status, 'sent');
+});
+
+test('reenvío manual por email: máximo 1', async () => {
+  await closeJob(A, { ref: 'A-7', client_name: 'Fede', client_email: 'fede@x.com' });
+  const s = await state(A);
+  const item = s.unanswered.find((r) => r.job_ref === 'A-7');
+  assert.equal(item.can_auto, true);
+  assert.equal((await post(A, `/api/surveys/${item.id}/resend`)).status, 200);
+  assert.equal((await post(A, `/api/surveys/${item.id}/resend`)).status, 409);
+});
+
+test('clientes en riesgo: aparece con 2 insatisfechos', async () => {
+  for (const ref of ['A-8', 'A-9']) {
+    const { survey_url } = await (await closeJob(A, { ref, client_name: 'Gina', client_email: 'gina@x.com' })).json();
+    await respond(survey_url, 'insatisfecho');
+  }
+  const s = await state(A);
+  const risk = s.at_risk.find((c) => c.name === 'Gina');
+  assert.equal(risk.insatisfechos, 2);
+});
+
+// ------------------------------------------------- scheduler (server B)
+
+test('scheduler: diferido → enviada → recordatorio → caso → seguimiento', async () => {
+  const res = await closeJob(B, { ref: 'B-1', client_name: 'Hugo', client_email: 'hugo@x.com' });
+  const body = await res.json();
+  assert.equal(body.status, 'scheduled', 'con delay > 0 queda programada');
+
+  // 1. El scheduler la envía cuando vence el diferido.
+  await poll(async () => {
+    const s = await state(B);
+    return s.unanswered.some((r) => r.job_ref === 'B-1');
   });
-  assert.equal(res.status, 303);
 
-  // Contacto guardado: el próximo trabajo de Carla sale automático sin email.
-  const next = await closeJob({ ref: 'J-4', client_name: 'Carla' });
-  assert.equal((await next.json()).sent, true);
-});
+  // 2. Sin respuesta, dispara el recordatorio automático (máx. 1).
+  await poll(async () => {
+    const s = await state(B);
+    return s.activity.some((a) => a.kind === 'reminder' && a.recipient === 'hugo@x.com');
+  });
 
-test('etapa 6: reenvío manual permitido una sola vez', async () => {
-  await closeJob({ ref: 'J-5', client_name: 'Dario', client_email: 'dario@x.com' });
-  const dash = await (await fetch(BASE)).text();
-  const id = dash.match(/\/surveys\/(\d+)\/resend/)[1];
-
-  const first = await fetch(`${BASE}/surveys/${id}/resend`, { method: 'POST', redirect: 'manual' });
-  assert.equal(first.status, 303);
-  const second = await fetch(`${BASE}/surveys/${id}/resend`, { method: 'POST', redirect: 'manual' });
-  assert.equal(second.status, 409);
-});
-
-test('métricas: los 4 números cierran', async () => {
-  const m = await (await fetch(`${BASE}/api/metrics`)).json();
-  assert.equal(m.total, 5);          // J-1..J-5
-  assert.equal(m.enviadas, 5);       // todas terminaron enviadas
-  assert.equal(m.pct_enviadas, 100);
-  assert.equal(m.respondidas, 1);    // solo Beto respondió
-  assert.equal(m.pct_satisfaccion, 0); // y respondió insatisfecho
+  // 3. Responde insatisfecho → caso; el scheduler manda el seguimiento al dueño.
+  await respond(body.survey_url, 'insatisfecho');
+  await poll(async () => {
+    const s = await state(B);
+    return s.activity.some((a) => a.kind === 'followup' && a.subject.includes('Hugo'));
+  });
 });

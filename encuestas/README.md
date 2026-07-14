@@ -1,112 +1,116 @@
-# Máquina de Encuestas — MVP
+# Máquina de Encuestas
 
-Encuestas de satisfacción post-trabajo para un SMB de servicios: el cierre del
-trabajo dispara automáticamente una encuesta de **una sola pregunta** al
-cliente, y el dueño ve el estado del negocio en un dashboard de 4 números —
-con **alerta inmediata** cuando alguien responde insatisfecho.
+Encuestas de satisfacción post-trabajo para un negocio de servicios: el cierre
+del trabajo dispara automáticamente una encuesta de **una sola pregunta** al
+cliente (por email o WhatsApp), y el dueño gestiona todo desde un tablero:
+métricas, casos de insatisfechos con seguimiento, y reenvíos con límite.
 
-Construido desde cero a partir de [`docs/user-journey.md`](docs/user-journey.md),
-implementando exactamente el MVP lean que ese documento recomienda.
+Diseñado a partir de [`docs/user-journey.md`](docs/user-journey.md) y evolucionado
+con lo adoptado en [`docs/comparacion-flujo-berlim.md`](docs/comparacion-flujo-berlim.md).
+
+![Tablero](docs/screenshot-tablero.png)
 
 ## Cómo correr
 
-Sin dependencias: solo Node.js ≥ 22 (usa `node:sqlite` y `node:http`).
+**Cero dependencias**: solo Node.js ≥ 22 (usa `node:http` y `node:sqlite`; el
+frontend es una SPA estática sin build).
 
 ```bash
-node server.js        # dashboard en http://localhost:3000
-node --test test.js   # smoke test end-to-end del flujo completo
+node server.js        # tablero en http://localhost:3000
+node --test test.js   # tests end-to-end (flujos + scheduler)
 ```
 
-Variables de entorno (todas opcionales):
+> Si venís del MVP v1, borrá `encuestas.db` (el esquema cambió).
 
-| Variable | Para qué |
-|---|---|
-| `PORT` / `BASE_URL` | Puerto y URL pública (la que va en los links de encuesta) |
-| `DB_PATH` | Archivo SQLite (default `encuestas.db`) |
-| `SEND_WEBHOOK_URL` | Webhook al que se POSTea cada envío (enchufe para email/WhatsApp) |
-| `ALERT_WEBHOOK_URL` | Webhook para alertas de insatisfecho (default: el anterior) |
-| `OWNER_CONTACT` | Email/teléfono del dueño que figura como destinatario de alertas |
+## Canales de envío — automatizar sin depender de Meta
 
-## Qué se construyó y por qué (análisis del journey)
+El requisito: automatizar envío y recolección **sin** atarse a la API de
+WhatsApp Business (aprobación de Meta, complejidad de integración). El sistema
+resuelve el envío por canal según el contacto disponible:
 
-El documento define 6 etapas, 3 riesgos ordenados y un recorte de MVP. Este
-código sigue ese recorte al pie de la letra:
+| Canal | Cómo funciona | Automatización |
+|---|---|---|
+| **Email** (default si hay email) | El mensaje sale a `SEND_WEBHOOK_URL` (Resend, SES, Zapier, n8n…) | 100% automática |
+| **WhatsApp tap-to-send** (si solo hay teléfono) | El sistema arma un link `wa.me` con el mensaje y el link a la encuesta ya escritos; el operario lo toca en el tablero y sale desde su propio WhatsApp | Un tap — sin API de Meta, sin aprobación |
+| **WhatsApp gateway** (opcional) | Si configurás `WHATSAPP_WEBHOOK_URL` (Twilio, un BSP, n8n), el envío pasa a ser 100% automático | 100% automática |
 
-### Etapa 1 — Cierre del trabajo ✅
-`POST /api/jobs/close` es el hook: un solo llamado desde el sistema del
-operario crea el trabajo **y** la encuesta, sin pasos extra. Es idempotente
-por número de trabajo (`ref`): un cierre duplicado devuelve 409 y no genera
-segunda encuesta. La métrica de la etapa (% de cierres que generan encuesta)
-es 100% por construcción — no existe cierre sin encuesta.
+La **recolección** es siempre automática: el cliente responde en una página
+pública de un tap (sin login) y la respuesta impacta en el tablero al instante.
+Todo lo que sale queda registrado en la tabla `outbox` (auditable en la
+sección "Actividad" del tablero).
 
-### Etapa 2 — Selección de encuesta ✂️ (recortada, como pide el doc)
-Una sola encuesta hardcodeada. El campo `type` del trabajo ya se guarda, así
-que el mapeo tipo→encuesta se agrega después sin migración.
+## El flujo completo
 
-### Etapa 3 — Envío ✅ (el riesgo #1 del doc)
-- Si el cliente tiene email conocido, la encuesta **sale sola** en el mismo
-  request del cierre.
-- Si no, queda visible en el dashboard como "Sin contacto" con un form de
-  una línea: cargás el email, se envía, **y el contacto queda guardado** en
-  la tabla `clients` — el próximo trabajo de ese cliente sale automático.
-  Esto ataca directamente la fricción que el doc marca como donde "muere la
-  adopción".
-- El transporte real no está acoplado: cada mensaje queda en la tabla
-  `outbox` (auditable) y se POSTea a `SEND_WEBHOOK_URL` si está configurada.
-  Ahí se enchufa Resend/Twilio/Zapier sin tocar el código.
+1. **Cierre del trabajo** → `POST /api/jobs/close` (idempotente por `ref`).
+   Si el cliente ya tiene contacto guardado, no hay que cargar nada.
+2. **Envío diferido** → la encuesta se programa a los `SEND_DELAY_MINUTES`
+   (default 45) para que llegue cuando el cliente ya vivió el resultado.
+3. **Envío** → automático (email/gateway) o tap-to-send (WhatsApp sin gateway).
+   Sin contacto: queda visible en el tablero; al cargarlo una vez, **queda en
+   memoria** para el próximo trabajo de ese cliente.
+4. **Respuesta** → 1 pregunta, 3 botones (😞 🙂 🤩), sin login, idempotente.
+   - **Excelente** → CTA de reseña pública en Google (`GOOGLE_REVIEW_URL`).
+   - **Insatisfecho** → alerta inmediata al dueño + **caso** abierto.
+5. **Casos** → `abierto → en_tratamiento → resuelto`, con notas, seguimiento
+   automático semanal al dueño mientras siga abierto, y agradecimiento al
+   cliente al resolver (con foco en la resolución).
+6. **Seguimiento de no respondidas** → reenvío automático a las
+   `AUTO_REMINDER_HOURS` (default 48) por canales automáticos, **máximo 1 y
+   corta** (regla anti-spam aplicada en el servidor, no solo en la UI).
 
-### Etapa 4 — Respuesta ✅
-`GET /s/:token`: una pregunta, tres botones grandes (Insatisfecho / Bueno /
-Excelente), sin login, mobile-first. Responder es un tap. Es idempotente: la
-primera respuesta gana y las siguientes ven "ya registramos tu respuesta".
+El tablero muestra los 4 números (% enviadas, % respondidas, % satisfacción,
+desglose), los casos, las colas de acción y los **clientes en riesgo**
+(insatisfacción recurrente).
 
-### Etapa 5 — Dashboard + alerta ✅ (el riesgo #2 del doc)
-Los 4 números del doc: % enviadas, % respondidas, % satisfacción y el
-desglose insatisfecho/bueno/excelente (también por API en `/api/metrics`).
-Y lo que el doc marca como el valor real del producto: cada respuesta
-"insatisfecho" dispara una **alerta inmediata** (outbox + `ALERT_WEBHOOK_URL`)
-con nombre, contacto y trabajo del cliente, y aparece arriba de todo en el
-dashboard como "⚠ Insatisfechos — llamar hoy".
+## Configuración (env, todo opcional)
 
-### Etapa 6 — Seguimiento ✅ (versión MVP: botón manual)
-Botón "Reenviar" en cada encuesta sin respuesta, con la regla anti-spam
-**definida antes de construir** (riesgo #3): máximo 1 reenvío por encuesta,
-aplicado en el servidor (409 al segundo intento), no solo escondiendo el botón.
+| Variable | Default | Para qué |
+|---|---|---|
+| `PORT` / `BASE_URL` | `3000` / `http://localhost:PORT` | URL pública (va en los links de encuesta) |
+| `DB_PATH` | `encuestas.db` | Archivo SQLite |
+| `SEND_DELAY_MINUTES` | `45` | Envío diferido post-cierre (0 = inmediato) |
+| `AUTO_REMINDER_HOURS` | `48` | Reenvío automático si no respondió (0 = off) |
+| `CASE_FOLLOWUP_DAYS` | `7` | Frecuencia del seguimiento de casos abiertos |
+| `GOOGLE_REVIEW_URL` | — | Link de reseña que ve quien responde "excelente" |
+| `SEND_WEBHOOK_URL` | — | Transporte de email (sin esto, queda solo en outbox — modo dev) |
+| `WHATSAPP_WEBHOOK_URL` | — | Gateway de WhatsApp (sin esto, modo tap-to-send) |
+| `ALERT_WEBHOOK_URL` | `SEND_WEBHOOK_URL` | Alertas y seguimientos al dueño |
+| `OWNER_CONTACT` | — | Destinatario de alertas/seguimientos |
 
-## Modelo de datos
-
-```
-clients  ─┬─ jobs ─── surveys ─── outbox
-          └───────────┘
-```
-
-- `clients` — la memoria de contactos (nombre único, email se completa una vez)
-- `jobs` — trabajo cerrado (`ref` único = idempotencia del hook)
-- `surveys` — estado: `pending_contact → sent → responded`, rating, contador de reenvíos
-- `outbox` — todo mensaje saliente (initial / reminder / alert), auditable
+El payload de todos los webhooks es
+`{kind, channel, recipient, subject, body}` — un `if` en Zapier/n8n alcanza
+para rutearlo a cualquier proveedor.
 
 ## API
 
 | Método y ruta | Qué hace |
 |---|---|
-| `POST /api/jobs/close` | Hook de cierre. JSON: `{ref, type?, client_name, client_email?}` → `{survey_url, sent}` |
-| `GET /s/:token` | Página de encuesta (pública, sin login) |
-| `POST /s/:token` | Registra la respuesta (`rating=insatisfecho\|bueno\|excelente`) |
-| `POST /surveys/:id/contact` | Carga el email faltante, lo guarda en el cliente y envía |
-| `POST /surveys/:id/resend` | Reenvío manual (máx. 1; después 409) |
-| `GET /api/metrics` | Los 4 números en JSON |
-| `GET /` | Dashboard |
+| `POST /api/jobs/close` | Hook de cierre: `{ref, type?, client_name, client_email?, client_phone?}` |
+| `GET /api/state` | Todo el estado del tablero en un call |
+| `GET /api/metrics` | Solo los números |
+| `POST /api/surveys/:id/contact` | Carga contacto faltante (`{email?, phone?}`) y envía |
+| `POST /api/surveys/:id/resend` | Reenvío manual por canal automático (máx. 1) |
+| `GET /wa/:id` | Tap-to-send: marca enviada/reenviada y redirige a `wa.me` |
+| `POST /api/cases/:id` | Estado y notas del caso (`{status?, notes?}`) |
+| `GET /s/:token` · `POST /s/:token` | Encuesta pública (1 tap, sin login) |
 
-## Qué quedó afuera (a propósito) y cómo se agrega
+## Estructura
 
-En el orden en que el doc dice "se agrega cuando alguien lo pida":
+```
+server.js      rutas + flujo core + páginas públicas de encuesta (SSR)
+db.js          esquema y consultas (node:sqlite)
+notify.js      outbox + webhooks + links wa.me + textos de mensajes
+scheduler.js   envíos diferidos, recordatorios 48hs, seguimiento de casos
+public/        tablero (SPA vanilla: index.html, app.js, style.css)
+test.js        tests end-to-end contra el server real (incluye scheduler)
+docs/          user journey, comparación con flujo BERLIM, capturas
+```
 
-1. **Reenvío automático a las 48-72 hs**: un cron que busque
-   `status='sent' AND resend_count=0 AND sent_at < datetime('now','-48 hours')`
-   y llame a la misma función `sendSurvey(..., 'reminder')` que hoy usa el botón.
-2. **Múltiples encuestas por tipo de servicio** (Etapa 2): tabla `survey_templates`
-   + mapeo desde `jobs.type`; la selección manual como excepción.
-3. **WhatsApp**: es solo otro consumidor del webhook de salida — el core no cambia.
-4. **Envío de email directo**: hoy el sistema registra en `outbox` y delega el
-   transporte al webhook; integrar un proveedor (Resend, SES) es implementar
-   ese consumidor.
+## Qué queda para después
+
+- **Múltiples encuestas por tipo de servicio** (etapa 2 del journey): tabla de
+  plantillas + mapeo desde `jobs.type`; el campo ya se guarda.
+- **NPS 0-10**: migrable cuando haya tasa de respuesta medida — el desglose
+  actual mapea a detractor/pasivo/promotor.
+- **Autenticación del tablero**: hoy no tiene (correr detrás de una VPN o
+  reverse proxy con auth hasta agregarla).

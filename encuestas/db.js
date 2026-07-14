@@ -1,4 +1,6 @@
 // Capa de datos — node:sqlite, sin dependencias externas.
+//
+// Nota: si venís del MVP v1, borrá encuestas.db (el esquema cambió).
 import { DatabaseSync } from 'node:sqlite';
 import { randomBytes } from 'node:crypto';
 
@@ -8,11 +10,12 @@ export function openDb(path = process.env.DB_PATH || 'encuestas.db') {
     PRAGMA journal_mode = WAL;
 
     -- Memoria de contactos: cada contacto cargado a mano queda guardado
-    -- para la próxima (fricción principal de la Etapa 3).
+    -- para la próxima (riesgo #1 del journey).
     CREATE TABLE IF NOT EXISTS clients (
       id         INTEGER PRIMARY KEY,
       name       TEXT NOT NULL,
       email      TEXT,
+      phone      TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
     CREATE UNIQUE INDEX IF NOT EXISTS clients_name ON clients(name COLLATE NOCASE);
@@ -26,28 +29,50 @@ export function openDb(path = process.env.DB_PATH || 'encuestas.db') {
     );
     CREATE UNIQUE INDEX IF NOT EXISTS jobs_ref ON jobs(ref);
 
-    -- status: pending_contact -> sent -> responded
+    -- Ciclo de vida:
+    --   pending_contact  sin datos de contacto (rescate manual)
+    --   scheduled        con contacto, esperando el envío diferido
+    --   ready            vencida, canal whatsapp sin gateway: espera el tap del operario
+    --   sent             enviada
+    --   responded        respondida
     CREATE TABLE IF NOT EXISTS surveys (
       id           INTEGER PRIMARY KEY,
       job_id       INTEGER NOT NULL UNIQUE REFERENCES jobs(id),
       client_id    INTEGER NOT NULL REFERENCES clients(id),
       token        TEXT NOT NULL UNIQUE,
+      channel      TEXT CHECK (channel IN ('email','whatsapp')),
       status       TEXT NOT NULL DEFAULT 'pending_contact'
-                   CHECK (status IN ('pending_contact','sent','responded')),
+                   CHECK (status IN ('pending_contact','scheduled','ready','sent','responded')),
       rating       TEXT CHECK (rating IN ('insatisfecho','bueno','excelente')),
       resend_count INTEGER NOT NULL DEFAULT 0,
+      scheduled_at TEXT,
       sent_at      TEXT,
       responded_at TEXT,
       created_at   TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
-    -- Todo lo que "sale" del sistema (encuestas, recordatorios, alertas)
-    -- queda registrado acá. El transporte real (email/WhatsApp) se enchufa
-    -- por webhook; ver notify.js.
+    -- Caso de recuperación por respuesta "insatisfecho" (adoptado del flujo
+    -- BERLIM): abierto -> en_tratamiento -> resuelto, con seguimiento
+    -- semanal al dueño mientras siga abierto.
+    CREATE TABLE IF NOT EXISTS cases (
+      id               INTEGER PRIMARY KEY,
+      survey_id        INTEGER NOT NULL UNIQUE REFERENCES surveys(id),
+      client_id        INTEGER NOT NULL REFERENCES clients(id),
+      status           TEXT NOT NULL DEFAULT 'abierto'
+                       CHECK (status IN ('abierto','en_tratamiento','resuelto')),
+      notes            TEXT NOT NULL DEFAULT '',
+      opened_at        TEXT NOT NULL DEFAULT (datetime('now')),
+      resolved_at      TEXT,
+      last_followup_at TEXT
+    );
+
+    -- Todo lo que sale del sistema queda acá (auditable). El transporte
+    -- real se enchufa por webhook; ver notify.js.
     CREATE TABLE IF NOT EXISTS outbox (
       id         INTEGER PRIMARY KEY,
       survey_id  INTEGER REFERENCES surveys(id),
-      kind       TEXT NOT NULL CHECK (kind IN ('initial','reminder','alert')),
+      kind       TEXT NOT NULL CHECK (kind IN ('initial','reminder','alert','followup','resolution')),
+      channel    TEXT NOT NULL,
       recipient  TEXT NOT NULL,
       subject    TEXT NOT NULL,
       body       TEXT NOT NULL,
@@ -61,51 +86,84 @@ export function newToken() {
   return randomBytes(16).toString('hex');
 }
 
-// Busca el cliente por nombre; si ya lo conocemos con email y esta vez no
-// vino, reusamos el guardado (auto-completar todo lo auto-completable).
-export function upsertClient(db, { name, email }) {
+export function normalizePhone(phone) {
+  const digits = String(phone || '').replace(/[^\d]/g, '');
+  return digits.length >= 8 ? digits : null;
+}
+
+// Busca el cliente por nombre; si ya lo conocemos con contacto y esta vez
+// no vino, reusamos el guardado (auto-completar todo lo auto-completable).
+export function upsertClient(db, { name, email, phone }) {
+  email = (email || '').trim() || null;
+  phone = normalizePhone(phone);
   const existing = db
     .prepare('SELECT * FROM clients WHERE name = ? COLLATE NOCASE')
     .get(name.trim());
   if (existing) {
-    if (email && email !== existing.email) {
-      db.prepare('UPDATE clients SET email = ? WHERE id = ?').run(email, existing.id);
-      return { ...existing, email };
+    const merged = { email: email || existing.email, phone: phone || existing.phone };
+    if (merged.email !== existing.email || merged.phone !== existing.phone) {
+      db.prepare('UPDATE clients SET email = ?, phone = ? WHERE id = ?')
+        .run(merged.email, merged.phone, existing.id);
     }
-    return existing;
+    return { ...existing, ...merged };
   }
   const { lastInsertRowid } = db
-    .prepare('INSERT INTO clients (name, email) VALUES (?, ?)')
-    .run(name.trim(), email || null);
+    .prepare('INSERT INTO clients (name, email, phone) VALUES (?, ?, ?)')
+    .run(name.trim(), email, phone);
   return db.prepare('SELECT * FROM clients WHERE id = ?').get(lastInsertRowid);
+}
+
+// Canal para un cliente: email si lo hay (100% automático), sino whatsapp.
+export function channelFor(client) {
+  if (client.email) return 'email';
+  if (client.phone) return 'whatsapp';
+  return null;
 }
 
 export function metrics(db) {
   const row = db.prepare(`
     SELECT
-      COUNT(*)                                                  AS total,
-      SUM(status IN ('sent','responded'))                       AS enviadas,
-      SUM(status = 'pending_contact')                           AS sin_contacto,
-      SUM(status = 'responded')                                 AS respondidas,
-      SUM(rating = 'insatisfecho')                              AS insatisfecho,
-      SUM(rating = 'bueno')                                     AS bueno,
-      SUM(rating = 'excelente')                                 AS excelente
+      COUNT(*)                                            AS total,
+      SUM(status IN ('sent','responded'))                 AS enviadas,
+      SUM(status = 'pending_contact')                     AS sin_contacto,
+      SUM(status IN ('scheduled','ready'))                AS en_cola,
+      SUM(status = 'responded')                           AS respondidas,
+      SUM(rating = 'insatisfecho')                        AS insatisfecho,
+      SUM(rating = 'bueno')                               AS bueno,
+      SUM(rating = 'excelente')                           AS excelente
     FROM surveys
   `).get();
+  const abiertos = db
+    .prepare("SELECT COUNT(*) AS n FROM cases WHERE status != 'resuelto'").get().n;
   const pct = (num, den) => (den ? Math.round((num / den) * 100) : 0);
+  const n = (x) => x ?? 0;
   return {
     total: row.total,
-    enviadas: row.enviadas ?? 0,
-    sin_contacto: row.sin_contacto ?? 0,
-    respondidas: row.respondidas ?? 0,
+    enviadas: n(row.enviadas),
+    sin_contacto: n(row.sin_contacto),
+    en_cola: n(row.en_cola),
+    respondidas: n(row.respondidas),
+    casos_abiertos: abiertos,
     desglose: {
-      insatisfecho: row.insatisfecho ?? 0,
-      bueno: row.bueno ?? 0,
-      excelente: row.excelente ?? 0,
+      insatisfecho: n(row.insatisfecho),
+      bueno: n(row.bueno),
+      excelente: n(row.excelente),
     },
-    pct_enviadas: pct(row.enviadas ?? 0, row.total),
-    pct_respondidas: pct(row.respondidas ?? 0, row.enviadas ?? 0),
-    // Satisfacción = bueno + excelente sobre respondidas.
-    pct_satisfaccion: pct((row.bueno ?? 0) + (row.excelente ?? 0), row.respondidas ?? 0),
+    pct_enviadas: pct(n(row.enviadas), row.total),
+    pct_respondidas: pct(n(row.respondidas), n(row.enviadas)),
+    pct_satisfaccion: pct(n(row.bueno) + n(row.excelente), n(row.respondidas)),
   };
+}
+
+// Clientes en riesgo (adoptado del flujo BERLIM): insatisfacción recurrente.
+export function atRiskClients(db) {
+  return db.prepare(`
+    SELECT c.id, c.name, c.email, c.phone,
+           COUNT(*) AS insatisfechos,
+           MAX(s.responded_at) AS ultimo
+    FROM surveys s JOIN clients c ON c.id = s.client_id
+    WHERE s.rating = 'insatisfecho'
+    GROUP BY c.id HAVING COUNT(*) >= 2
+    ORDER BY ultimo DESC
+  `).all();
 }
