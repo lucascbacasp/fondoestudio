@@ -27,15 +27,23 @@ const fmt = (s) => {
 
 const contact = (r) => esc(r.client_email || r.email || ((r.client_phone || r.phone) ? `+${r.client_phone || r.phone}` : 'sin datos'));
 const channelBadge = (ch) =>
-  ch ? `<span class="badge">${ch === 'email' ? '✉ email' : '💬 whatsapp'}</span>` : '';
+  ch ? `<span class="badge"><i class="chip ${ch === 'email' ? 'accent' : 'good'}"></i>${ch}</span>` : '';
 
 const STATUS_LABEL = {
   pending_contact: 'sin contacto', scheduled: 'programada', ready: 'lista (whatsapp)',
   sent: 'enviada', responded: 'respondida',
 };
-const RATING_EMOJI = { insatisfecho: '😞', bueno: '🙂', excelente: '🤩' };
+const RATING_CHIP = { insatisfecho: 'crit', bueno: 'warn', excelente: 'good' };
 const ratingPill = (r) =>
-  r ? `<span class="rating-pill ${r}">${RATING_EMOJI[r]} ${r}</span>` : '<span class="muted">—</span>';
+  r ? `<span class="rating-pill ${r}"><i class="chip ${RATING_CHIP[r]}"></i>${r}</span>` : '<span class="muted">—</span>';
+
+function toast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => t.classList.remove('show'), 3200);
+}
 
 const pct = (a, b) => (b ? Math.round((a / b) * 100) : 0);
 
@@ -57,7 +65,7 @@ async function post(url, body) {
     body: JSON.stringify(body || {}),
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) alert(data.error || 'Error');
+  if (!res.ok) toast(data.error || 'No se pudo completar la acción.');
   return data;
 }
 
@@ -82,9 +90,9 @@ function tiles(m) {
       ${d.excelente ? `<span style="flex:${flex(d.excelente)};background:var(--status-good)"></span>` : ''}
     </div>
     <div class="dist-legend">
-      <span><i class="chip crit"></i>😞 Insatisfecho · ${d.insatisfecho}</span>
-      <span><i class="chip warn"></i>🙂 Bueno · ${d.bueno}</span>
-      <span><i class="chip good"></i>🤩 Excelente · ${d.excelente}</span>
+      <span><i class="chip crit"></i>Insatisfecho · ${d.insatisfecho}</span>
+      <span><i class="chip warn"></i>Bueno · ${d.bueno}</span>
+      <span><i class="chip good"></i>Excelente · ${d.excelente}</span>
     </div>
   </div>` : ''}`;
 }
@@ -109,14 +117,14 @@ function casesSection(cases) {
         <button class="ghost" data-case="${k.id}" data-status="${k.status}">Guardar notas</button>
       </div>`}
     </div>`;
-  return `<h2>⚠ Casos de insatisfechos${open.length ? ` (${open.length} abiertos — llamar hoy)` : ''}</h2>
+  return `<h2>Casos de insatisfechos${open.length ? ` (${open.length} abiertos — llamar hoy)` : ''}</h2>
     ${open.map(card).join('') || '<p class="empty">Sin casos abiertos.</p>'}
     ${resolved.length ? resolved.map(card).join('') : ''}`;
 }
 
 function readySection(ready) {
   if (!ready.length) return '';
-  return `<h2>💬 Para enviar por WhatsApp (un tap)</h2>
+  return `<h2>Para enviar por WhatsApp (un tap)</h2>
     <p class="muted">El botón abre WhatsApp con el mensaje y el link ya armados; solo tocás enviar.</p>
     ${ready.map((r) => `
     <div class="card">
@@ -172,12 +180,13 @@ function scheduledSection(scheduled) {
 function activitySection(activity) {
   if (!activity.length) return '';
   const KIND = {
-    initial: 'encuesta', reminder: 'recordatorio', alert: '⚠ alerta',
-    followup: '⏰ seguimiento', resolution: 'resolución',
+    initial: 'encuesta', reminder: 'recordatorio', alert: 'alerta',
+    followup: 'seguimiento', resolution: 'resolución',
   };
+  const KCHIP = { initial: 'accent', reminder: 'mutedc', alert: 'crit', followup: 'warn', resolution: 'good' };
   return `<details class="activity"><summary>Actividad reciente (${activity.length})</summary>
     ${activity.map((a) => `
-      <div class="activity-item"><b>${KIND[a.kind] || a.kind}</b>
+      <div class="activity-item"><i class="chip ${KCHIP[a.kind] || 'mutedc'}"></i><b>${KIND[a.kind] || a.kind}</b>
         <span class="muted">${esc(a.channel)} → ${esc(a.recipient)} · ${fmt(a.created_at)}</span><br>
         ${esc(a.subject)}</div>`).join('')}</details>`;
 }

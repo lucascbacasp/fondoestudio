@@ -170,17 +170,47 @@ function publicPage(title, content) {
 <html lang="es"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${esc(title)}</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232a6fc4'/%3E%3Cpath d='M9 17l4.5 4.5L23 12' stroke='%23fff' stroke-width='3.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
 <style>
-  :root { color-scheme: light dark; }
-  body { font-family: system-ui, sans-serif; max-width: 480px; margin: 8vh auto; padding: 0 1.2rem; line-height: 1.5; }
-  h1 { font-size: 1.35rem; }
-  .muted { opacity: .65; font-size: .9rem; }
-  .btns { display: grid; gap: 1rem; margin-top: 2rem; }
-  .btns button, .cta { font: inherit; font-size: 1.25rem; padding: 1.1rem; border-radius: 14px;
-    border: 2px solid #8886; background: transparent; cursor: pointer; width: 100%;
-    text-align: center; text-decoration: none; display: block; color: inherit; box-sizing: border-box; }
-  .btns button:hover, .cta:hover { border-color: #58a; }
-  .cta { border-color: #f7b32b; margin-top: 1.5rem; }
+  @font-face {
+    font-family: 'Outfit';
+    src: url('/fonts/Outfit-Variable.woff2') format('woff2');
+    font-weight: 300 800;
+    font-display: swap;
+  }
+  :root {
+    color-scheme: light;
+    --page: #f7f6f2; --surface: #fdfdfb; --ink: #1c1b18; --muted: #8f8c83;
+    --hairline: #e7e5de; --accent: #2a6fc4; --warn: #d99a00;
+    --shadow: 0 1px 2px rgba(28,27,24,.04), 0 10px 28px -14px rgba(28,27,24,.10);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      color-scheme: dark;
+      --page: #131311; --surface: #1b1b18; --ink: #f4f3ef; --muted: #8f8c83;
+      --hairline: #2b2b27; --accent: #5b96e0; --warn: #e0b23e;
+      --shadow: 0 1px 2px rgba(0,0,0,.25), 0 12px 32px -16px rgba(0,0,0,.45);
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: 'Outfit', 'Segoe UI Variable Display', 'SF Pro Display', 'Helvetica Neue', system-ui, sans-serif;
+    background: var(--page); color: var(--ink);
+    max-width: 480px; margin: 0 auto; padding: 10vh 1.2rem 3rem; line-height: 1.5;
+  }
+  h1 { font-size: 1.45rem; font-weight: 650; letter-spacing: -0.02em; line-height: 1.2; text-wrap: balance; }
+  .muted { color: var(--muted); font-size: .9rem; }
+  .btns { display: grid; gap: .9rem; margin-top: 2rem; }
+  .btns button, .cta {
+    font: inherit; font-size: 1.2rem; font-weight: 550; padding: 1.05rem; border-radius: 14px;
+    border: 1px solid var(--hairline); background: var(--surface); box-shadow: var(--shadow);
+    cursor: pointer; width: 100%; text-align: center; text-decoration: none; display: block;
+    color: inherit; transition: border-color .18s ease, transform .12s ease;
+  }
+  .btns button:hover, .cta:hover { border-color: var(--accent); }
+  .btns button:active, .cta:active { transform: translateY(1px) scale(.99); }
+  :focus-visible { outline: none; box-shadow: 0 0 0 2px var(--page), 0 0 0 4px var(--accent); }
+  .cta { border-color: var(--warn); margin-top: 1.5rem; }
 </style>
 </head><body>${content}</body></html>`;
 }
@@ -280,6 +310,18 @@ const server = createServer(async (req, res) => {
       const [file, type] = STATIC[path];
       res.writeHead(200, { 'content-type': type });
       return res.end(await readFile(join(PUBLIC_DIR, file)));
+    }
+
+    // Fuentes self-hosteadas (opcional: soltar los .woff2 en public/fonts/).
+    const fontMatch = path.match(/^\/fonts\/([\w-]+\.woff2)$/);
+    if (req.method === 'GET' && fontMatch) {
+      try {
+        const buf = await readFile(join(PUBLIC_DIR, 'fonts', fontMatch[1]));
+        res.writeHead(200, { 'content-type': 'font/woff2', 'cache-control': 'public, max-age=31536000, immutable' });
+        return res.end(buf);
+      } catch {
+        return sendJson(res, 404, { error: 'fuente no encontrada' });
+      }
     }
 
     if (req.method === 'GET' && path === '/api/state') return sendJson(res, 200, stateForDashboard());
