@@ -24,12 +24,35 @@ import {
   surveyMessage, alertMessage, followupMessage, resolutionMessage,
 } from './notify.js';
 import { startScheduler, dispatchDue, canAutoSend } from './scheduler.js';
+import { seedDemo, isEmpty } from './seed.js';
 
 const PORT = Number(process.env.PORT || 3000);
-const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
+// RENDER_EXTERNAL_URL la inyecta Render automáticamente.
+const BASE_URL = process.env.BASE_URL || process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
 const DELAY_SECONDS = Math.round(Number(process.env.SEND_DELAY_MINUTES ?? 45) * 60);
 const PUBLIC_DIR = join(import.meta.dirname, 'public');
 const db = openDb();
+
+// Hosting efímero (Render free): con DEMO_SEED=1, cada arranque con base
+// vacía repuebla los datos de prueba — la demo siempre despierta poblada.
+if (process.env.DEMO_SEED === '1' && isEmpty(db)) {
+  console.log(`[seed] base vacía: ${seedDemo(db)} encuestas de demo cargadas`);
+}
+
+// ---------------------------------------------------------------- auth
+// Basic Auth para el tablero y la API del operario (ADMIN_PASS lo activa).
+// Lo que ve el cliente final queda SIEMPRE público: /s/:token, /fonts, /healthz.
+const ADMIN_USER = process.env.ADMIN_USER || 'admin';
+const ADMIN_PASS = process.env.ADMIN_PASS || '';
+const PUBLIC_ROUTES = /^\/(s\/[a-f0-9]{32}|fonts\/|healthz$)/;
+
+function isAuthorized(req) {
+  if (!ADMIN_PASS) return true; // sin ADMIN_PASS no hay auth (modo dev)
+  const header = req.headers.authorization || '';
+  if (!header.startsWith('Basic ')) return false;
+  const [user, ...rest] = Buffer.from(header.slice(6), 'base64').toString().split(':');
+  return user === ADMIN_USER && rest.join(':') === ADMIN_PASS;
+}
 
 // ---------------------------------------------------------------- helpers
 
@@ -305,6 +328,16 @@ const server = createServer(async (req, res) => {
   const path = url.pathname;
 
   try {
+    if (req.method === 'GET' && path === '/healthz') return sendJson(res, 200, { ok: true });
+
+    if (!PUBLIC_ROUTES.test(path) && !isAuthorized(req)) {
+      res.writeHead(401, {
+        'www-authenticate': 'Basic realm="Máquina de Encuestas"',
+        'content-type': 'application/json',
+      });
+      return res.end(JSON.stringify({ error: 'autenticación requerida' }));
+    }
+
     // ------- tablero (SPA estática, sin build)
     if (req.method === 'GET' && STATIC[path]) {
       const [file, type] = STATIC[path];
@@ -498,4 +531,5 @@ startScheduler(db, { sendSurvey, sendFollowup });
 server.listen(PORT, () => {
   console.log(`Máquina de Encuestas corriendo en ${BASE_URL}`);
   console.log(`  envío diferido: ${DELAY_SECONDS / 60} min · gateway WhatsApp: ${hasWhatsAppGateway() ? 'sí' : 'modo tap-to-send'}`);
+  if (!ADMIN_PASS) console.warn('  ADVERTENCIA: sin ADMIN_PASS el tablero queda abierto (solo para desarrollo)');
 });

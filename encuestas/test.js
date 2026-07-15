@@ -12,7 +12,8 @@ import { rmSync } from 'node:fs';
 
 const A = 'http://localhost:3777';
 const B = 'http://localhost:3778';
-const DBS = ['test-a.db', 'test-b.db'];
+const C = 'http://localhost:3779';
+const DBS = ['test-a.db', 'test-b.db', 'test-c.db'];
 const REVIEW_URL = 'https://g.page/r/test-review';
 const servers = [];
 
@@ -79,7 +80,11 @@ before(async () => {
     CASE_FOLLOWUP_DAYS: '0.00003',     // seguimiento ~2.6s después de abrir caso
     TICK_MS: '300',
   });
-  await Promise.all([waitUp(A), waitUp(B)]);
+  startServer(3779, 'test-c.db', {
+    SEND_DELAY_MINUTES: '0', AUTO_REMINDER_HOURS: '0', TICK_MS: '100000',
+    ADMIN_PASS: 'secreta123', DEMO_SEED: '1',
+  });
+  await Promise.all([waitUp(A), waitUp(B), waitUp(C)]);
 });
 
 after(() => {
@@ -218,6 +223,47 @@ test('CRM: registro con IDs legibles y agregados por cliente y tipo', async () =
   assert.ok(crm.cases.length >= 1);
   assert.ok(crm.activity.length >= 1);
   assert.ok(crm.metrics.total >= 9);
+});
+
+// ------------------------------------- auth + seed de demo (server C)
+
+test('auth: tablero y API protegidos, encuesta del cliente pública', async () => {
+  // Sin credenciales: 401 en tablero, API y wa.
+  for (const p of ['/', '/api/state', '/api/crm', '/wa/1']) {
+    assert.equal((await fetch(C + p)).status, 401, `${p} debería pedir auth`);
+  }
+  // /healthz siempre público (health-check del hosting).
+  assert.equal((await fetch(`${C}/healthz`)).status, 200);
+
+  // Con credenciales: pasa.
+  const auth = { authorization: 'Basic ' + Buffer.from('admin:secreta123').toString('base64') };
+  const state = await (await fetch(`${C}/api/state`, { headers: auth })).json();
+  assert.ok(state.metrics);
+
+  // La encuesta del cliente final NO pide login jamás. El token no viaja
+  // por la API (correcto): lo sacamos directo de la base de test.
+  const crm = await (await fetch(`${C}/api/crm`, { headers: auth })).json();
+  const sent = crm.surveys.find((s) => s.status === 'sent');
+  const { DatabaseSync } = await import('node:sqlite');
+  const cdb = new DatabaseSync('test-c.db');
+  const tok = cdb.prepare('SELECT token FROM surveys WHERE id = ?').get(sent.id).token;
+  cdb.close();
+  assert.equal((await fetch(`${C}/s/${tok}`)).status, 200);
+});
+
+test('seed de demo: DEMO_SEED=1 puebla encuestas de prueba al arrancar', async () => {
+  const auth = { authorization: 'Basic ' + Buffer.from('admin:secreta123').toString('base64') };
+  const m = await (await fetch(`${C}/api/metrics`, { headers: auth })).json();
+  assert.ok(m.total >= 14, `esperaba >=14 encuestas seed, hay ${m.total}`);
+  assert.ok(m.respondidas >= 10);
+  assert.ok(m.desglose.insatisfecho >= 2);
+
+  const crm = await (await fetch(`${C}/api/crm`, { headers: auth })).json();
+  assert.ok(crm.cases.some((k) => k.status === 'abierto'));
+  assert.ok(crm.cases.some((k) => k.status === 'resuelto'));
+  assert.ok(crm.by_type.length >= 3, 'seed cubre varios tipos de servicio');
+  // Cliente en riesgo (2 insatisfechos del mismo cliente).
+  assert.ok(crm.clients.some((c) => c.insatisfecho >= 2));
 });
 
 // ------------------------------------------------- scheduler (server B)

@@ -17,8 +17,25 @@ frontend es una SPA estática sin build).
 
 ```bash
 node server.js        # tablero en http://localhost:3000
-node --test test.js   # tests end-to-end (flujos + scheduler)
+npm run seed          # poblar encuestas de prueba (o DEMO_SEED=1 al arrancar)
+node --test test.js   # tests end-to-end (flujos + scheduler + auth + seed)
 ```
+
+## Deploy en Render (URL pública en ~5 minutos)
+
+1. En [render.com](https://render.com): **New + → Blueprint** y elegir este
+   repo — Render lee `render.yaml` y configura todo solo (plan free).
+2. Cargar en el dashboard las dos variables marcadas como manuales:
+   `ADMIN_PASS` (la clave del tablero) y opcionalmente `GOOGLE_REVIEW_URL`.
+3. Listo: la URL pública queda tipo `https://maquina-encuestas.onrender.com`.
+   `BASE_URL` no hace falta (usa `RENDER_EXTERNAL_URL` automáticamente) y
+   `DEMO_SEED=1` repuebla los datos de prueba cada vez que el servicio
+   despierta — el plan free tiene filesystem efímero, ideal para demo.
+   Guión de presentación en [`docs/guion-demo.md`](docs/guion-demo.md).
+
+Para datos persistentes (piloto real): Render con disco pago o Railway/Fly
+con volumen — solo hay que apuntar `DB_PATH` al mount. También hay
+`Dockerfile` para cualquier otro host.
 
 > Si venís del MVP v1, borrá `encuestas.db` (el esquema cambió).
 
@@ -85,6 +102,8 @@ entidad central. Las vistas están separadas por tarea (ver el análisis en
 | `WHATSAPP_WEBHOOK_URL` | — | Gateway de WhatsApp (sin esto, modo tap-to-send) |
 | `ALERT_WEBHOOK_URL` | `SEND_WEBHOOK_URL` | Alertas y seguimientos al dueño |
 | `OWNER_CONTACT` | — | Destinatario de alertas/seguimientos |
+| `ADMIN_USER` / `ADMIN_PASS` | `admin` / — | Basic Auth del tablero y la API (sin `ADMIN_PASS` queda abierto: solo dev). Las encuestas del cliente (`/s/:token`) son siempre públicas |
+| `DEMO_SEED` | — | Con `1`, puebla datos de prueba al arrancar con base vacía (ideal hosting efímero) |
 
 El payload de todos los webhooks es
 `{kind, channel, recipient, subject, body}` — un `if` en Zapier/n8n alcanza
