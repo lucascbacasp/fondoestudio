@@ -195,6 +195,31 @@ test('clientes en riesgo: aparece con 2 insatisfechos', async () => {
   assert.equal(risk.insatisfechos, 2);
 });
 
+test('CRM: registro con IDs legibles y agregados por cliente y tipo', async () => {
+  const crm = await (await fetch(`${A}/api/crm`)).json();
+
+  // Toda encuesta tiene código citable ENC-nnnn.
+  assert.ok(crm.surveys.length >= 9);
+  for (const s of crm.surveys) assert.match(s.code, /^ENC-\d{4}$/);
+
+  // Agregados por cliente: Gina tiene 2 encuestas, 2 respondidas, 2 insatisfechos.
+  const gina = crm.clients.find((c) => c.name === 'Gina');
+  assert.equal(gina.encuestas, 2);
+  assert.equal(gina.respondidas, 2);
+  assert.equal(gina.insatisfecho, 2);
+
+  // Agregados por tipo: A-1 fue el único trabajo de plomería.
+  const plomeria = crm.by_type.find((t) => t.type === 'plomería');
+  assert.equal(plomeria.encuestas, 1);
+  const sinTipo = crm.by_type.find((t) => t.type === '(sin tipo)');
+  assert.ok(sinTipo.encuestas >= 1);
+
+  // Los casos y la actividad vienen para armar la timeline del cliente.
+  assert.ok(crm.cases.length >= 1);
+  assert.ok(crm.activity.length >= 1);
+  assert.ok(crm.metrics.total >= 9);
+});
+
 // ------------------------------------------------- scheduler (server B)
 
 test('scheduler: diferido → enviada → recordatorio → caso → seguimiento', async () => {

@@ -17,6 +17,7 @@ import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import {
   openDb, newToken, upsertClient, channelFor, normalizePhone, metrics, atRiskClients,
+  surveyCode, surveysList, clientAggregates, typeAggregates,
 } from './db.js';
 import {
   deliver, waLink, hasWhatsAppGateway,
@@ -224,7 +225,7 @@ function stateForDashboard() {
   `).all();
 
   const brief = (r) => ({
-    id: r.id, status: r.status, channel: r.channel, rating: r.rating,
+    id: r.id, code: surveyCode(r.id), status: r.status, channel: r.channel, rating: r.rating,
     resend_count: r.resend_count, scheduled_at: r.scheduled_at, sent_at: r.sent_at,
     responded_at: r.responded_at, client_name: r.client_name,
     client_email: r.client_email, client_phone: r.client_phone,
@@ -283,6 +284,24 @@ const server = createServer(async (req, res) => {
 
     if (req.method === 'GET' && path === '/api/state') return sendJson(res, 200, stateForDashboard());
     if (req.method === 'GET' && path === '/api/metrics') return sendJson(res, 200, metrics(db));
+
+    // Vistas CRM: registro de encuestas + agregados por cliente y por tipo.
+    // Un solo endpoint con el dataset completo; el filtrado es client-side
+    // (volumen SMB — si crece a decenas de miles, pasa a filtros server-side).
+    if (req.method === 'GET' && path === '/api/crm') {
+      const cases = db.prepare(`
+        SELECT k.*, s.id AS survey_id, j.ref AS job_ref
+        FROM cases k JOIN surveys s ON s.id = k.survey_id JOIN jobs j ON j.id = s.job_id
+      `).all();
+      return sendJson(res, 200, {
+        surveys: surveysList(db),
+        clients: clientAggregates(db),
+        by_type: typeAggregates(db),
+        cases,
+        activity: db.prepare('SELECT * FROM outbox ORDER BY id DESC LIMIT 200').all(),
+        metrics: metrics(db),
+      });
+    }
 
     // ------- Etapa 1: hook de cierre de trabajo
     if (req.method === 'POST' && path === '/api/jobs/close') {

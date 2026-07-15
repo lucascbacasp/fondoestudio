@@ -58,9 +58,18 @@ sección "Actividad" del tablero).
    `AUTO_REMINDER_HOURS` (default 48) por canales automáticos, **máximo 1 y
    corta** (regla anti-spam aplicada en el servidor, no solo en la UI).
 
-El tablero muestra los 4 números (% enviadas, % respondidas, % satisfacción,
-desglose), los casos, las colas de acción y los **clientes en riesgo**
-(insatisfacción recurrente).
+## Vistas (modelo CRM)
+
+Cada encuesta es un registro con ID citable (`ENC-0042`) y el cliente es la
+entidad central. Las vistas están separadas por tarea (ver el análisis en
+[`docs/journey-operario-crm.md`](docs/journey-operario-crm.md)):
+
+| Vista | Tarea | Contenido |
+|---|---|---|
+| **Operación** | hacer | KPIs, casos abiertos, colas de acción (WhatsApp, contactos, reenvíos) |
+| **Encuestas** | buscar | Registro completo filtrable (estado × tipo × búsqueda) + export CSV |
+| **Clientes** | contexto | Agregados por cliente y ficha con timeline (trabajos, envíos, respuestas, casos) |
+| **Resultados** | decidir | General (empresa) · por tipo de servicio · por cliente |
 
 ## Configuración (env, todo opcional)
 
@@ -86,7 +95,8 @@ para rutearlo a cualquier proveedor.
 | Método y ruta | Qué hace |
 |---|---|
 | `POST /api/jobs/close` | Hook de cierre: `{ref, type?, client_name, client_email?, client_phone?}` |
-| `GET /api/state` | Todo el estado del tablero en un call |
+| `GET /api/state` | Todo el estado de la vista Operación en un call |
+| `GET /api/crm` | Registro de encuestas + agregados por cliente y por tipo (vistas CRM) |
 | `GET /api/metrics` | Solo los números |
 | `POST /api/surveys/:id/contact` | Carga contacto faltante (`{email?, phone?}`) y envía |
 | `POST /api/surveys/:id/resend` | Reenvío manual por canal automático (máx. 1) |

@@ -155,6 +155,53 @@ export function metrics(db) {
   };
 }
 
+// ID legible y citable: interno sigue siendo el entero; esto es presentación.
+export const surveyCode = (id) => `ENC-${String(id).padStart(4, '0')}`;
+
+// Registro CRM: toda encuesta con su cliente y trabajo.
+export function surveysList(db, limit = 2000) {
+  return db.prepare(`
+    SELECT s.id, s.status, s.channel, s.rating, s.resend_count,
+           s.scheduled_at, s.sent_at, s.responded_at, s.created_at,
+           c.id AS client_id, c.name AS client_name, c.email AS client_email, c.phone AS client_phone,
+           j.ref AS job_ref, j.type AS job_type, j.closed_at
+    FROM surveys s JOIN clients c ON c.id = s.client_id JOIN jobs j ON j.id = s.job_id
+    ORDER BY s.id DESC LIMIT ?
+  `).all(limit).map((r) => ({ ...r, code: surveyCode(r.id) }));
+}
+
+// Agregados por cliente: la ficha resumida de cada uno.
+export function clientAggregates(db) {
+  return db.prepare(`
+    SELECT c.id, c.name, c.email, c.phone,
+           COUNT(s.id)                          AS encuestas,
+           SUM(s.status IN ('sent','responded')) AS enviadas,
+           SUM(s.status = 'responded')          AS respondidas,
+           SUM(s.rating = 'insatisfecho')       AS insatisfecho,
+           SUM(s.rating = 'bueno')              AS bueno,
+           SUM(s.rating = 'excelente')          AS excelente,
+           MAX(coalesce(s.responded_at, s.sent_at, s.created_at)) AS ultimo
+    FROM clients c LEFT JOIN surveys s ON s.client_id = c.id
+    GROUP BY c.id ORDER BY ultimo DESC
+  `).all();
+}
+
+// Agregados por tipo de servicio: el corte que hace accionable el promedio.
+export function typeAggregates(db) {
+  return db.prepare(`
+    SELECT coalesce(j.type, '(sin tipo)')       AS type,
+           COUNT(s.id)                          AS encuestas,
+           SUM(s.status IN ('sent','responded')) AS enviadas,
+           SUM(s.status = 'responded')          AS respondidas,
+           SUM(s.rating = 'insatisfecho')       AS insatisfecho,
+           SUM(s.rating = 'bueno')              AS bueno,
+           SUM(s.rating = 'excelente')          AS excelente
+    FROM surveys s JOIN jobs j ON j.id = s.job_id
+    GROUP BY coalesce(j.type, '(sin tipo)')
+    ORDER BY encuestas DESC
+  `).all();
+}
+
 // Clientes en riesgo (adoptado del flujo BERLIM): insatisfacción recurrente.
 export function atRiskClients(db) {
   return db.prepare(`

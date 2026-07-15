@@ -38,6 +38,15 @@ body {
   line-height: 1.5;
 }
 header h1 { font-size: 1.35rem; margin: 0 0 .2rem; }
+
+/* ---- pestañas de navegación ---- */
+.tabs { display: flex; gap: .2rem; margin-top: .8rem; border-bottom: 1px solid var(--hairline); flex-wrap: wrap; }
+.tabs a {
+  padding: .45rem .9rem; text-decoration: none; color: var(--ink-2);
+  border-bottom: 2px solid transparent; margin-bottom: -1px; font-size: .92rem;
+}
+.tabs a[aria-current="page"] { color: var(--ink); font-weight: 600; border-bottom-color: var(--accent); }
+.tabs a:hover { color: var(--ink); }
 h2 { font-size: 1rem; margin: 2rem 0 .7rem; }
 .muted { color: var(--muted); font-size: .85rem; }
 footer { margin-top: 3rem; border-top: 1px solid var(--hairline); padding-top: 1rem; }
@@ -127,3 +136,35 @@ form.close-job button { grid-column: 1 / -1; justify-self: start; }
 details.activity summary { cursor: pointer; color: var(--ink-2); font-size: .9rem; }
 .activity-item { border-bottom: 1px solid var(--hairline); padding: .4rem 0; font-size: .85rem; }
 .activity-item:last-child { border-bottom: none; }
+
+/* ---- vistas CRM ---- */
+.filters { display: flex; gap: .5rem; flex-wrap: wrap; margin: .8rem 0; align-items: center; }
+.filters input[type="search"] { min-width: 220px; flex: 1; }
+.count-note { color: var(--muted); font-size: .82rem; margin-left: auto; }
+tr.clickable { cursor: pointer; }
+tr.clickable:hover td { background: var(--hairline); }
+.code { font-variant-numeric: tabular-nums; color: var(--ink-2); font-size: .85em; }
+.rating-pill { display: inline-block; font-size: .78rem; padding: .05rem .5rem; border-radius: 999px; border: 1px solid; }
+.rating-pill.insatisfecho { border-color: var(--status-crit); color: var(--status-crit); }
+.rating-pill.bueno { border-color: var(--status-warn); color: var(--status-warn); }
+.rating-pill.excelente { border-color: var(--status-good); color: var(--status-good); }
+
+.mini-dist { display: flex; height: 8px; border-radius: 4px; overflow: hidden; gap: 2px; min-width: 90px; }
+.mini-dist span { display: block; border-radius: 2px; min-width: 3px; }
+
+/* ---- ficha de cliente / timeline ---- */
+.back-link { display: inline-block; margin-bottom: .6rem; color: var(--accent); text-decoration: none; }
+.timeline { list-style: none; padding: 0; margin: .5rem 0; }
+.timeline li {
+  position: relative; padding: .35rem 0 .35rem 1.3rem;
+  border-left: 2px solid var(--hairline); margin-left: .4rem; font-size: .9rem;
+}
+.timeline li::before {
+  content: ""; position: absolute; left: -6px; top: .75rem;
+  width: 10px; height: 10px; border-radius: 50%;
+  background: var(--surface); border: 2px solid var(--muted);
+}
+.timeline li.ev-crit::before { border-color: var(--status-crit); background: var(--status-crit); }
+.timeline li.ev-good::before { border-color: var(--status-good); background: var(--status-good); }
+.timeline li.ev-warn::before { border-color: var(--status-warn); background: var(--status-warn); }
+.timeline .when { color: var(--muted); font-size: .8rem; }
